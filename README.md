@@ -1,7 +1,7 @@
 # Medical_Image_Analysis_PJ
 
 ### Dataset
-- Prepare download the COVID-QU-Ex dataset and put it under data/datasets/COVID-QU-Ex datasets
+- Prepare download the COVID-QU-Ex dataset and put it under data/datasets/COVID-QU-Ex
 
 ### Pre-trained models
 - Pre-trained backbones for resnet50 and resnet101 can be found in [Google Driver](https://drive.google.com/drive/folders/1dEJL_KSkZZ0nIEy6zwqqb93L4zBDvCV-?usp=sharing)
