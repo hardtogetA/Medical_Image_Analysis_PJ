@@ -64,7 +64,6 @@ def main():
     assert args.classes > 1
     assert args.zoom_factor in [1, 2, 4, 8]
     assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
     if args.manual_seed is not None:
         cudnn.benchmark = False
         cudnn.deterministic = True
