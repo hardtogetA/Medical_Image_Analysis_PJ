@@ -3,7 +3,7 @@ DATA:
   classes: 2
 
 TRAIN:
-  arch: asgnet
+  arch: asgnet_cls
   layers: 50
   sync_bn: False
   train_h: 473
@@ -17,11 +17,11 @@ TRAIN:
   ignore_label: 255
   padding_label: 255
   aux_weight: 1.0
-  train_gpu: [0]
+  train_gpu: [0,1]
   workers: 32  # data loader workers
-  batch_size: 8  # batch size for training
+  batch_size: 16  # batch size for training
   batch_size_val: 1
-  base_lr: 0.0025
+  base_lr: 0.0001
   epochs: 20
   start_epoch: 0
   power: 0.9 # 0 means no decay
@@ -31,7 +31,7 @@ TRAIN:
   print_freq: 5
   save_freq: 20
   save_path: exp/asgnet/covid/model
-  weight: segmentation.pth
+  weight: classification.pth
   resume: 
   evaluate: True
   train_iter: 10

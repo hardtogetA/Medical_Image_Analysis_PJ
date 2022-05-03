@@ -7,7 +7,7 @@ import logging
 import argparse
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1'
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -18,6 +18,8 @@ import torch.optim
 import torch.utils.data
 import torch.multiprocessing as mp
 import torch.distributed as dist
+import torchvision.models as models
+
 from tensorboardX import SummaryWriter
 
 from model import *
@@ -107,8 +109,8 @@ def main_worker(gpu, ngpus_per_node, argss):
         param.requires_grad = False
     for param in model.layer3.parameters():
         param.requires_grad = False
-    for param in model.layer4.parameters():
-        param.requires_grad = False
+    # for param in model.layer4.parameters():
+    #     param.requires_grad = False
         
     optimizer = model._optimizer(args)
     global logger, writer
@@ -119,18 +121,16 @@ def main_worker(gpu, ngpus_per_node, argss):
     logger.info(model)
     print(args)
 
-    model = torch.nn.DataParallel(model.cuda(), device_ids=[0])
+    model = torch.nn.DataParallel(model.cuda(), device_ids=[0,1])
     
-    """
     if args.weight:
         if os.path.isfile(args.weight):
             logger.info("=> loading weight '{}'".format(args.weight))
             checkpoint = torch.load(args.weight)
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
             logger.info("=> loaded weight '{}'".format(args.weight))
         else:
             logger.info("=> no weight found at '{}'".format(args.weight))
-    """
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -178,7 +178,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         val_sampler = None
         val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False, num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    max_iou = 0.
+    max_acc = 0.
     filename = 'ASGNet.pth'
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -190,7 +190,7 @@ def main_worker(gpu, ngpus_per_node, argss):
             random.seed(args.manual_seed + epoch)
 
         epoch_log = epoch + 1
-        loss_train, aux_loss_train, FBIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch)
+        loss_train, aux_loss_train, FBIoU_train, mAcc_train, allAcc_train = train(train_loader, model,  optimizer, epoch)
         if main_process():
             writer.add_scalar('loss_train', loss_train, epoch_log)
             writer.add_scalar('aux_loss_train', aux_loss_train, epoch_log)
@@ -199,18 +199,18 @@ def main_worker(gpu, ngpus_per_node, argss):
             writer.add_scalar('allAcc_train', allAcc_train, epoch_log)     
 
         if args.evaluate and (epoch % 2 == 0 or (args.epochs<=50 and epoch%1==0)):
-            loss_val, FBIoU_val, mAcc_val, allAcc_val, mIoU_val = validate(val_loader, model, criterion)
+            loss_val, FBIoU_val, mAcc_val, allAcc_val, mIoU_val = validate(val_loader, model,  criterion)
             if main_process():
                 writer.add_scalar('loss_val', loss_val, epoch_log)
                 writer.add_scalar('FBIoU_val', FBIoU_val, epoch_log)
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
                 writer.add_scalar('mIoU_val', mIoU_val, epoch_log)
-            if mIoU_val > max_iou:
-                max_iou = mIoU_val
+            if allAcc_val > max_acc:
+                max_acc = allAcc_val
                 if os.path.exists(filename):
                     os.remove(filename)            
-                filename = args.save_path + '/train_epoch_' + str(epoch) + '_'+str(max_iou)+'.pth'
+                filename = args.save_path + '/train_epoch_' + str(epoch) + '_'+str(max_acc)+'.pth'
                 logger.info('Saving checkpoint to: ' + filename)
                 torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, filename)
 
@@ -228,6 +228,7 @@ def train(train_loader, model, optimizer, epoch):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
+    accuracy_meter = AverageMeter()
 
     model.train()
     end = time.time()
@@ -244,8 +245,9 @@ def train(train_loader, model, optimizer, epoch):
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         cls = cls.cuda(non_blocking=True)
-        
-        output, main_loss, aux_loss = model(x=input, y=target)
+
+        # logger.info(cls)
+        output, predict_cls, main_loss, aux_loss = model(x=input, y=target, cls=cls)
 
         if not args.multiprocessing_distributed:
             main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
@@ -268,11 +270,15 @@ def train(train_loader, model, optimizer, epoch):
         intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
         intersection_meter.update(intersection), union_meter.update(union), target_meter.update(target)
 
+        # logger.info("predict:"+str(predict_cls.argmax(dim=-1))+",gt:"+str(cls))
+
+        cls_accuracy = (predict_cls.argmax(dim=-1) == cls).float().mean().item()
         accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
         main_loss_meter.update(main_loss.item(), n)
         aux_loss_meter.update(aux_loss.item(), n)
         loss_meter.update(loss.item(), n)
         batch_time.update(time.time() - end)
+        accuracy_meter.update(cls_accuracy)
         end = time.time()
 
         remain_iter = max_iter - current_iter
@@ -296,27 +302,27 @@ def train(train_loader, model, optimizer, epoch):
                                                           main_loss_meter=main_loss_meter,
                                                           aux_loss_meter=aux_loss_meter,
                                                           loss_meter=loss_meter,
-                                                          accuracy=accuracy))
+                                                          accuracy=cls_accuracy))
         if main_process():
             writer.add_scalar('loss_train_batch', main_loss_meter.val, current_iter)
             writer.add_scalar('aux_loss_train_batch', aux_loss_meter.val, current_iter)
             writer.add_scalar('FBIoU_train_batch', np.mean(intersection / (union + 1e-10)), current_iter)
             writer.add_scalar('mAcc_train_batch', np.mean(intersection / (target + 1e-10)), current_iter)
-            writer.add_scalar('allAcc_train_batch', accuracy, current_iter)
+            writer.add_scalar('allAcc_train_batch', cls_accuracy, current_iter,)
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
     FBIoU = np.mean(iou_class)
     mAcc = np.mean(accuracy_class)
-    allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+    allAcc = accuracy_meter.avg
 
     if main_process():
-        logger.info('Train result at epoch [{}/{}]: /FBIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(epoch, args.epochs, FBIoU, mAcc, allAcc))
+        logger.info('Train result at epoch [{}/{}]: /FBIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(epoch, args.epochs, FBIoU, mAcc, accuracy_meter.avg))
         for i in range(args.classes):
             logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))        
-    return main_loss_meter.avg, aux_loss_meter.avg, FBIoU, mAcc, allAcc
+    return main_loss_meter.avg, aux_loss_meter.avg, FBIoU, mAcc, accuracy_meter.avg
 
-
+@torch.no_grad()
 def validate(val_loader, model, criterion):
     if main_process():
         logger.info('>>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>')
@@ -327,6 +333,7 @@ def validate(val_loader, model, criterion):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
+    accuracy_meter = AverageMeter()
     front_intersection_meter = 0
     front_union_meter = 0
 
@@ -344,61 +351,64 @@ def validate(val_loader, model, criterion):
     iter_num = 0
     total_time = 0
 
-    for e in range(10):
-        for i, (input, target, cls, ori_label) in enumerate(val_loader):
-            if (iter_num-1) * args.batch_size_val >= test_num:
-                break
-            iter_num += 1    
-            data_time.update(time.time() - end)
-            input = input.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            ori_label = ori_label.cuda(non_blocking=True)
-            start_time = time.time()
-            output = model(x=input, y=target)
-            total_time = total_time + 1
-            model_time.update(time.time() - start_time)
+    # for e in range(10):
+    for i, (input, target, cls, ori_label) in enumerate(val_loader):
+        if (iter_num-1) * args.batch_size_val >= test_num:
+            break
+        iter_num += 1    
+        data_time.update(time.time() - end)
+        input = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        ori_label = ori_label.cuda(non_blocking=True)
+        cls = cls.cuda(non_blocking=True)
+        start_time = time.time()
+        output, predict_cls = model(x=input, y=target, cls=cls)
+        total_time = total_time + 1
+        model_time.update(time.time() - start_time)
 
-            if args.ori_resize:
-                longerside = max(ori_label.size(1), ori_label.size(2))
-                backmask = torch.ones(ori_label.size(0), longerside, longerside).cuda()*255
-                backmask[0, :ori_label.size(1), :ori_label.size(2)] = ori_label
-                target = backmask.clone().long()
+        if args.ori_resize:
+            longerside = max(ori_label.size(1), ori_label.size(2))
+            backmask = torch.ones(ori_label.size(0), longerside, longerside).cuda()*255
+            backmask[0, :ori_label.size(1), :ori_label.size(2)] = ori_label
+            target = backmask.clone().long()
 
-            output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)         
-            loss = criterion(output, target)    
+        output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)         
+        loss = criterion(output, target)    
 
-            n = input.size(0)
-            loss = torch.mean(loss)
+        n = input.size(0)
+        loss = torch.mean(loss)
 
-            output = output.max(1)[1]
+        output = output.max(1)[1]
 
-            intersection, union, new_target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
-            intersection, union, target, new_target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy(), new_target.cpu().numpy()
-            intersection_meter.update(intersection), union_meter.update(union), target_meter.update(new_target)
-                
-            front_intersection_meter += intersection[1]
-            front_union_meter += union[1] 
+        intersection, union, new_target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
+        intersection, union, target, new_target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy(), new_target.cpu().numpy()
+        intersection_meter.update(intersection), union_meter.update(union), target_meter.update(new_target)
+            
+        front_intersection_meter += intersection[1]
+        front_union_meter += union[1] 
 
-            accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
-            loss_meter.update(loss.item(), input.size(0))
-            batch_time.update(time.time() - end)
-            end = time.time()
-            if ((i + 1) % (test_num/100) == 0) and main_process():
-                logger.info('Test: [{}/{}] '
-                            'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
-                            'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
-                            'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
-                            'Accuracy {accuracy:.4f}.'.format(iter_num* args.batch_size_val, test_num,
-                                                              data_time=data_time,
-                                                              batch_time=batch_time,
-                                                              loss_meter=loss_meter,
-                                                              accuracy=accuracy))
+        cls_accuracy = (predict_cls.argmax(dim=-1) == cls).float().mean().item()
+        accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
+        loss_meter.update(loss.item(), input.size(0))
+        batch_time.update(time.time() - end)
+        accuracy_meter.update(cls_accuracy)
+        end = time.time()
+        if ((i + 1) % (test_num/100) == 0) and main_process():
+            logger.info('Test: [{}/{}] '
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
+                        'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
+                        'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
+                        'Accuracy {accuracy:.4f}.'.format(iter_num* args.batch_size_val, test_num,
+                                                            data_time=data_time,
+                                                            batch_time=batch_time,
+                                                            loss_meter=loss_meter,
+                                                            accuracy=cls_accuracy))
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
     FBIoU = np.mean(iou_class)
     mAcc = np.mean(accuracy_class)
-    allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+    allAcc = accuracy_meter.avg
     
     # class_iou_class = []
     # class_miou = 0
@@ -415,13 +425,13 @@ def validate(val_loader, model, criterion):
     logger.info('meanIoU---Val result: mIoU {:.4f}.'.format(mIoU))
 
     if main_process():
-        logger.info('FBIoU---Val result: FBIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(FBIoU, mAcc, allAcc))
+        logger.info('FBIoU---Val result: FBIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(FBIoU, mAcc, accuracy_meter.avg))
         for i in range(args.classes):
             logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
         logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
     print('avg inference time: {:.4f}, count: {}'.format(model_time.avg, test_num))
-    return loss_meter.avg, FBIoU, mAcc, allAcc, mIoU
+    return loss_meter.avg, FBIoU, mAcc, accuracy_meter.avg, mIoU
 
 
 if __name__ == '__main__':

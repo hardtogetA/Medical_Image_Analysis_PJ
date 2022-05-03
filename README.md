@@ -18,3 +18,8 @@
     ```
     sh tool/test.sh covid asgnet resnet50
     ```
+
+    E.g. Test ASGNet with ResNet50 on COVID-QU-Ex:
+    ```
+    sh tool/test_cls.sh covid asgnet resnet50
+    ```

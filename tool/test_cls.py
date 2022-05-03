@@ -18,7 +18,7 @@ import torch.optim
 import torch.utils.data
 import torch.multiprocessing as mp
 from tensorboardX import SummaryWriter
-import torchvision
+
 from model import *
 from util import dataset
 from util import transform, config
@@ -64,7 +64,7 @@ def main():
     assert args.classes > 1
     assert args.zoom_factor in [1, 2, 4, 8]
     assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
     if args.manual_seed is not None:
         cudnn.benchmark = False
         cudnn.deterministic = True
@@ -106,7 +106,7 @@ def main_worker(gpu, ngpus_per_node, argss):
     logger.info(model)
     print(args)
 
-    model = torch.nn.DataParallel(model.cuda(), device_ids=[0])
+    model = nn.parallel.DataParallel(model,[0])
 
     if args.weight:
         if os.path.isfile(args.weight):
@@ -135,8 +135,8 @@ def main_worker(gpu, ngpus_per_node, argss):
             transform.ToTensor(),
             transform.Normalize(mean=mean, std=std)])
     val_data = dataset.SemData(data_root=args.data_root, transform=val_transform, mode='test')
-    val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=True,
-                                             num_workers=args.workers, pin_memory=False, sampler=None)
+    val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False,
+                                             num_workers=args.workers, pin_memory=True, sampler=None)
     test(val_loader, model, criterion, args)
 
 def test(val_loader, model, criterion, args):
@@ -149,6 +149,7 @@ def test(val_loader, model, criterion, args):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
+    accuracy_meter = AverageMeter()
     front_intersection_meter = 0
     front_union_meter = 0
 
@@ -159,9 +160,13 @@ def test(val_loader, model, criterion, args):
         torch.cuda.manual_seed_all(args.manual_seed)
         random.seed(args.manual_seed)
 
+    clss = []
+    predict_clss=[]
+
     model.eval()
     end = time.time()
     test_num = len(val_loader)
+    logger.info(f"test_num{test_num} batch_size{args.batch_size_val}")
     assert test_num % args.batch_size_val == 0
     iter_num = 0
     total_time = 0
@@ -175,8 +180,9 @@ def test(val_loader, model, criterion, args):
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         ori_label = ori_label.cuda(non_blocking=True)
+        cls = cls.cuda(non_blocking=True)
         start_time = time.time()
-        output = model(x=input, y=target)
+        output, predict_cls = model(x=input, y=target, cls=cls)
         total_time = total_time + 1
         model_time.update(time.time() - start_time)
 
@@ -194,12 +200,6 @@ def test(val_loader, model, criterion, args):
 
         output = output.max(1)[1]
 
-        if i<100:
-            # print(output.shape,output.max(),output.min(),output.type())
-            torchvision.utils.save_image(output.float(), os.path.join(args.save_path,f'{i}_{cls}_output.png'))
-            torchvision.utils.save_image(target.float(), os.path.join(args.save_path,f'{i}_{cls}_target.png'))
-            torchvision.utils.save_image(input.float()/255, os.path.join(args.save_path,f'{i}_{cls}_input.png'))
-
         intersection, union, new_target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
         intersection, union, target, new_target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy(), new_target.cpu().numpy()
         intersection_meter.update(intersection), union_meter.update(union), target_meter.update(new_target)
@@ -207,9 +207,14 @@ def test(val_loader, model, criterion, args):
         front_intersection_meter += intersection[1]
         front_union_meter += union[1]
 
-        accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
+        # accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
+        accuracy = (predict_cls.argmax(dim=-1) == cls).float().mean().item()
+        predict_clss.append(predict_cls.argmax(dim=-1).detach().cpu().numpy())
+        clss.append(cls.detach().cpu().numpy())
+
         loss_meter.update(loss.item(), input.size(0))
         batch_time.update(time.time() - end)
+        accuracy_meter.update(accuracy)
         end = time.time()
         if ((i + 1) % (test_num/100) == 0) and main_process():
             logger.info('Test: [{}/{}] '
@@ -226,15 +231,28 @@ def test(val_loader, model, criterion, args):
     accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
     FBIoU = np.mean(iou_class)
     mAcc = np.mean(accuracy_class)
-    allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+    # allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+    allAcc = accuracy_meter.avg
+
+    from sklearn.metrics import confusion_matrix
+    array = confusion_matrix(np.concatenate(clss),np.concatenate(predict_clss))
+    import seaborn as sn
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    classes = ['covid','non-covid','normal']
+    df_cm = pd.DataFrame(array, index = classes, columns = classes)
+    plt.figure(figsize = (10,7))
+    svm = sn.heatmap(df_cm, annot=True, cmap="Blues", fmt="d")
+    figure = svm.get_figure()    
+    figure.savefig('svm_conf.png', dpi=400)
 
     mIoU = front_intersection_meter/(front_union_meter+ 1e-10)
-    logger.info('meanIoU---Val result: mIoU {:.4f}.'.format(mIoU))
+    # logger.info('meanIoU---Val result: mIoU {:.4f}.'.format(mIoU))
 
     if main_process():
-        logger.info('FBIoU---Val result: FBIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(FBIoU, mAcc, allAcc))
-        for i in range(args.classes):
-            logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
+        logger.info('Val result: Acc {:.4f}.'.format(allAcc))
+        # for i in range(args.classes):
+        #     logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
         logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
     print('avg inference time: {:.4f}, count: {}'.format(model_time.avg, test_num))

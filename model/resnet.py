@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.utils.model_zoo as model_zoo
+from loguru import logger
 
 BatchNorm = nn.BatchNorm2d
 
@@ -104,7 +105,7 @@ class ResNet(nn.Module):
             self.inplanes = 64
             self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
             self.bn1 = BatchNorm(64)
-            self.relu = nn.ReLU(inplace=True)
+            self.relu1 = nn.ReLU(inplace=True)
         else:
             self.inplanes = 128
             self.conv1 = conv3x3(3, 64, stride=2)
